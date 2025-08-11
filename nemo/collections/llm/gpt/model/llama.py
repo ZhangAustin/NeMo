@@ -23,6 +23,9 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import nn
+from transformers.generation import GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrainedModel
 
 from nemo.collections.llm.gpt.model.base import GPTConfig, GPTModel, torch_dtype_from_mcore_config
 from nemo.collections.llm.gpt.model.llama4_utils import get_llama4_layer_spec
@@ -487,6 +490,100 @@ class MLPerfLoRALlamaModel(LlamaModel):
             model_transform=model_transform,
             model_context_managers=model_context_managers,
         )
+
+
+class MIMO_CustomSplitLLamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+    """Llama model variant that consumes and predicts token pairs.
+
+    This model concatenates embeddings of two consecutive tokens and projects
+    them back to the hidden size using a small MLP before passing the result
+    through the standard Llama transformer blocks.  The output hidden states
+    are then used to produce logits for two tokens simultaneously via two
+    independent language modeling heads.
+    """
+
+    _tied_weights_keys = ["lm_head_1.weight", "lm_head_2.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LlamaModel(config)
+        hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+
+        self.input_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size, bias=False),
+        )
+        self.lm_head_1 = nn.Linear(hidden_size, self.vocab_size, bias=False)
+        self.lm_head_2 = nn.Linear(hidden_size, self.vocab_size, bias=False)
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> CausalLMOutputWithPast:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+
+        bsz, seq_len, hidden = inputs_embeds.shape
+        if seq_len % 2 != 0:
+            raise ValueError("Sequence length must be even for MIMO model")
+
+        pair_embeds = torch.cat([inputs_embeds[:, 0::2, :], inputs_embeds[:, 1::2, :]], dim=-1)
+        pair_embeds = self.input_mlp(pair_embeds)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, ::2]
+        if position_ids is not None:
+            position_ids = position_ids[:, ::2]
+
+        outputs = self.model(
+            inputs_embeds=pair_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits1 = self.lm_head_1(hidden_states)
+        logits2 = self.lm_head_2(hidden_states)
+        logits = torch.stack([logits1, logits2], dim=2).reshape(bsz, seq_len, self.vocab_size)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+
+        if not return_dict:
+            output = (logits, outputs.past_key_values)
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
 
 
 @io.model_importer(LlamaModel, "hf")
@@ -1411,4 +1508,5 @@ __all__ = [
     "CodeLlamaConfig70B",
     "LlamaModel",
     "MLPerfLoRALlamaModel",
+    "MIMO_CustomSplitLLamaForCausalLM",
 ]
